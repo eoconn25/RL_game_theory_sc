@@ -10,5 +10,7 @@ class config:
         self.holding_cost = 1.0
         self.stockout_cost = 10.0
 
-        # player behavior
-        
+        # player behavior - choose from L0, L1, L2
+        self.retailer_level = 'L1'
+        self.manufacturer_level = 'L0'
+        self.supplier_level = 'L0'

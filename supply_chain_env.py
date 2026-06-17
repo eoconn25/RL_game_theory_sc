@@ -3,30 +3,35 @@ from gymnasium import spaces
 import numpy as np
 
 class LevelKSupplyChainEnv(gym.Env):
-    
     metadata = {"render_modes":["human"]}
 
     def __init__(self, config):
         super(LevelKSupplyChainEnv, self).__init__()
 
+        # initialize parameters from the received config object
         self.T = config.epoch_length
         self.max_capacity = config.max_capacity
         self.max_order = config.max_order
         self.h_weight = config.holding_cost
         self.s_weight = config.stockout_cost
 
+        # initialize behavior settings
+        self.retailer_level = config.retailer_level
+        self.manufacturer_level = config.manufacturer_level
+        self.supplier_level = config.supplier_level
+
         # ACTION SPACE
         self.action_space = spaces.Discrete(self.max_order + 1)  # Distributor chooses a discrete shipment quant to send downstream
 
         # OBSERVATION SPACE
-        # state vector consists of [distributor inventory, distributor backlog, incoming retailer order]
+        # state vector will have [distributor inventory, distributor backlog, incoming retailer order]
         self.observation_space = spaces.MultiDiscrete([
             self.max_capacity + 1,
             self.max_capacity + 1,
             self.max_order + 1
         ])
 
-    def reset(self, seed=None, options=None):
+    def reset(self, seed=None):
         super().reset(seed=seed)
         
         self.current_step = 0
@@ -48,7 +53,91 @@ class LevelKSupplyChainEnv(gym.Env):
 
         return initial_state, {}
     
+        
+    # helper function for generating orders/demand according to level
+    def ordering_logic(self, entity:str, demand:int, level:str):
+        # determines order quantity to send upstream accoridng to the day's demand
+        if level == 'L0':
+            order = demand  # LEVEL 0 NAIVE
+        elif level == 'L1':
+            order = round(demand * 1.5)  # LEVEL 1 SHORTAGE GAME
+        elif level == 'L2':
+            order = round(demand * 2)  # LEVEL 2 EXTREME SHORTAGE GAME
+        else:
+            print('ERROR UNCLEAR LEVEL')
+        
+        # total order, adds in the backlog
+        total_order = order + self.backlog[entity]
+        return total_order
+
+
     def step(self, action):
+        # process one daily tick of the supply chain
+        self.current_step += 1
+
+        # INFORMATION LOOP - starting with customer, demand moves from downstream to upstream
+        customer_demand = int(self.np_random.poisson(lam=10))  # customer demand
+        retailer_order = self.ordering_logic('Retailer', customer_demand, self.retailer_level)
+        distributor_order = action  # RL agent
+        manufacturer_order = self.ordering_logic('Manufacturer', distributor_order, self.manufacturer_level)
+        supplier_order = self.ordering_logic('Supplier', manufacturer_order, self.supplier_level)
+
+        # MATERIAL LOOP - material moves from upstream to downstream, consisting of order plus outstanding backlog
+        supplier_shipment =  min(self.inv['Supplier'], manufacturer_order)
+        manufacturer_shipment =  min(self.inv['Manufacturer'], distributor_order)
+        distributor_shipment =  min(self.inv['Distributor'], retailer_order)
+        retailer_shipment =  min(self.inv['Retailer'], customer_demand + self.backlog['Retailer'])
+
+        # UPDATE INVENTORIES - now that everything has been shipped, update our inventories
+        self.inv['Retailer'] += distributor_shipment
+        self.inv['Distributor'] -= distributor_shipment
+
+        self.inv['Distributor'] += manufacturer_shipment
+        self.inv['Manufacturer'] -= manufacturer_shipment
+        
+        self.inv['Manufacturer'] += supplier_shipment
+        self.inv['Supplier'] -= supplier_shipment
+
+        self.inv['Supplier'] += supplier_order
+
+        # UPDATE BACKLOGS
+        self.backlog['Retailer'] = (self.backlog['Retailer'] + customer_demand) - retailer_shipment
+        self.backlog['Distributor'] = retailer_order - distributor_shipment
+        self.backlog['Manufacturer'] = distributor_order - manufacturer_shipment
+        self.backlog['Supplier'] = manufacturer_order - supplier_shipment
+        
+
+        # add boundaries to prevent overflow
+        for key in self.inv:
+            self.inv[key] = int(np.clip(self.inv[key], 0, self.max_capacity))
+            self.backlog[key] = int(np.clip(self.backlog[key], 0, self.max_capacity))
+        clamped_retailer_order = int(np.clip(retailer_order, 0, self.max_order))
+        
+        # AGENT'S REWARD
+        # stockout objective
+        r_stockout = -self.s_weight * self.backlog["Distributor"]
+        # low inventory objective
+        r_holding = -self.h_weight * (1.0 * self.inv["Distributor"])
+        # combine
+        reward = r_stockout + r_holding
+
+        # return packet
+        next_state = np.array([
+            self.inv["Distributor"],
+            self.backlog["Distributor"],
+            clamped_retailer_order
+        ], dtype=np.int32)
+
+        terminated = self.current_step >= self.T
+        truncated = False
+
+        return next_state, reward, terminated, truncated, {'customer_demand': customer_demand, 
+                                                           'retailer_order': retailer_order, 
+                                                           'manufacturer_order': manufacturer_order,
+                                                           'supplier_order': supplier_order}
+
+
+'''    def step(self, action):
         # process one daily tick of the supply chain
         self.current_step += 1
         #distributor_shipment_choice = action
@@ -64,6 +153,8 @@ class LevelKSupplyChainEnv(gym.Env):
 
         # retailer issues order upstream - - LEVEL 0 NAIVE
         retailer_order = customer_demand
+
+        retailer_order = self.ordering_logic("Retailer", "Distributor", retailer_total_demand, self.retailer_level)
 
         # ---- 2. Distributor moves, our RL agent ----
         distributor_total_demand = self.backlog["Distributor"] + retailer_order
@@ -101,8 +192,8 @@ class LevelKSupplyChainEnv(gym.Env):
         self.inv["Supplier"] -= supplier_shipment
         self.backlog["Supplier"] = supplier_total_demand - supplier_shipment
 
-        # supplier makes new stock - - NEED TO TUNE PROBABLY
-        self.inv["Supplier"] += 15
+        # supplier makes new stock - - currently just replaces what it ships
+        self.inv["Supplier"] += supplier_shipment
 
 
         # ---- Enforce boundaries to prevent overflow ----
@@ -131,5 +222,4 @@ class LevelKSupplyChainEnv(gym.Env):
         truncated = False
 
         return next_state, reward, terminated, truncated, {'customer_demand': customer_demand}
-
-
+'''

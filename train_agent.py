@@ -4,38 +4,39 @@ from supply_chain_env import LevelKSupplyChainEnv
 from sim_config import config
 
 def train_and_evaluate(sim_config, naive = False):
-    # --- 1. INITIALIZE ENVIRONMENT ---
+    # initialize environment with our config settings
     env = LevelKSupplyChainEnv(sim_config)
     
-    # --- 2. INITIALIZE THE TABULAR Q-TABLE ---
-    # Dimensions: [Dist_Inv, Dist_Backlog, Retailer_Order, Action_Shipment]
+    # initialize tabular Q-table
+    # our state will consist of [Distributor Inventory, Distributor Backlog, Retailer Order]
     state_dims = [sim_config.max_capacity + 1, sim_config.max_capacity + 1, sim_config.max_order + 1]
+    # the action the agent will choose is how much to order from the Manufacturer
     action_dim = sim_config.max_order + 1
     q_table = np.zeros(state_dims + [action_dim])
     
-    # --- 3. HYPERPARAMETERS ---
-    num_episodes = 8000     # Increased episodes to ensure strong policy convergence
-    alpha = 0.1             # Learning rate
-    gamma = 0.90            # Discount factor
-    epsilon = 1.0           # Exploration probability
-    epsilon_decay = 0.999   # Slower decay to allow thorough state space exploration
+    # hyperparams
+    num_episodes = 8000
+    alpha = 0.1  # the LR
+    gamma = 0.90  # discount factor
+    epsilon = 1.0  # exploration prob
+    epsilon_decay = 0.999  # slow decay for good epxloration
     min_epsilon = 0.01
 
     print(f"Training RL Distributor | h_weight: {sim_config.holding_cost} | s_weight: {sim_config.stockout_cost}")
 
-    # --- 4. THE TRAINING LOOP ---
+    # --- training loop ---
     for episode in range(num_episodes):
         state, _ = env.reset()
         terminated = False
         truncated = False
         
         while not (terminated or truncated):
-            inv_idx, backlog_idx, order_idx = state[0], state[1], state[2]
+            inv_idx, backlog_idx, order_idx = state[0], state[1], state[2]  # get info for state
             
             if naive:
-                action = order_idx
+                action = order_idx  # if we want to toggle RL agent as a Naive L0 player
             else:
-                # Epsilon-Greedy selection
+                # epsilon-greedy selection
                 if np.random.rand() < epsilon:
                     action = env.action_space.sample()
                 else:
@@ -44,7 +45,7 @@ def train_and_evaluate(sim_config, naive = False):
             next_state, reward, terminated, truncated, _ = env.step(action)
             next_inv, next_backlog, next_order = next_state[0], next_state[1], next_state[2]
             
-            # Q-Table Update using Bellman Optimality Equation
+            # Q-Table update with Bellman Optimality Equation
             old_value = q_table[inv_idx, backlog_idx, order_idx, action]
             next_max = np.max(q_table[next_inv, next_backlog, next_order, :])
             new_value = old_value + alpha * (reward + gamma * next_max - old_value)
@@ -52,28 +53,33 @@ def train_and_evaluate(sim_config, naive = False):
             
             state = next_state
             
-        epsilon = max(min_epsilon, epsilon * epsilon_decay)
+        epsilon = max(min_epsilon, epsilon * epsilon_decay)  # decay exploration
         
         if (episode + 1) % 1000 == 0:
-            print(f"Episode {episode + 1}/{num_episodes} complete. Epsilon dropped to {epsilon:.3f}")
+            print(f"Episode {episode + 1}/{num_episodes} complete | Epsilon: {epsilon:.3f}")
             
     print("Training complete, running a test sim")
 
-    # --- 5. EVALUATION EPOCH (VISUALIZATION CAPTURE) ---
+    # --- evaluation epoch to visualize ---
     state, _ = env.reset(seed=25)
     terminated = False
     truncated = False
     
+    # list initialization for metrics we will track
+    # demands and orders
     customer_demands = []
     retailer_orders = []
     distributor_orders = []
     manufacturer_orders = []
-
+    supplier_orders = []
+    
+    # inventory levels
     retailer_inv = []
     distributor_inv = []
     manufacturer_inv = []
     supplier_inv = []
 
+    # backlog/stockouts of the distributor
     distributor_backlog = []
     
     while not (terminated or truncated):
@@ -82,18 +88,19 @@ def train_and_evaluate(sim_config, naive = False):
         if naive:
             trained_action = order_idx
         else:        
-            # Pure exploitation: choose the optimal action learned during training
+            # choose the optimal action learned during training, pure exploitation
             trained_action = np.argmax(q_table[inv_idx, backlog_idx, order_idx, :])
         
-        print(f"Day: {env.current_step} | Order In: {order_idx} | Action Chosen: {trained_action} | Current Inv: {inv_idx}")
+        # print(f"Day: {env.current_step} | Order In: {order_idx} | Action Chosen: {trained_action} | Current Inv: {inv_idx}")
         
         next_state, reward, terminated, truncated, info_dict = env.step(trained_action)
         
         # track everyone's orders and the demand
         customer_demands.append(info_dict['customer_demand'])
-        retailer_orders.append(order_idx)
+        retailer_orders.append(info_dict['retailer_order'])
         distributor_orders.append(trained_action)  # WHAT RL CHOSE
-        manufacturer_orders.append(env.backlog["Manufacturer"] + trained_action)
+        manufacturer_orders.append(info_dict['manufacturer_order'])
+        supplier_orders.append(info_dict['supplier_order'])
 
         # track everyone's inventory
         retailer_inv.append(env.inv["Retailer"])
@@ -106,13 +113,19 @@ def train_and_evaluate(sim_config, naive = False):
         
         state = next_state
 
-    # --- 6. CALCULATE EVALUATION VARIANCE ---
-    print("\n=== POST-TRAINING RESULTS: ORDER VARIANCE ===")
+    # --- calculate metrics in evaluation epoch ---
+    print("\n=== EVALUATION RESULTS: ORDER VARIANCE ===")
     print(f"Customer Demand Variance:    {np.var(customer_demands):.2f}")
     print(f"Retailer Order Variance:     {np.var(retailer_orders):.2f}")
     print(f"Distributor Order Variance:  {np.var(distributor_orders):.2f}")
     print(f"Manufacturer Order Variance: {np.var(manufacturer_orders):.2f}")
     print("=============================================")
+    print(f"Total Bullwhip Distortion: {(np.var(manufacturer_orders) / np.var(customer_demands)):.2f}")
+    print("=============================================")
+    print(f"Total Customer Demand: {sum(customer_demands)}")
+    print(f"Total Distributor Inventory: {sum(distributor_inv)}")
+    print(f"Total Distributor Stockouts: {sum(distributor_backlog)}")
+
 
     # --- create visual for our metrics ---
     fig, axs = plt.subplots(3,1, figsize=(9,8), sharex=True)
@@ -152,8 +165,6 @@ def train_and_evaluate(sim_config, naive = False):
 
     #plt.xlabel("Timestep (Days)")
 
-
-    
 
 if __name__ == "__main__":
     sim_config = config()
